@@ -13,6 +13,14 @@
 	"upload_source_maps": true,
 	"compatibility_flags": [
 		"nodejs_compat"
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "finance_bot_db",
+			"database_id": "4e184cac-88ab-42f0-9054-6c17d40e2cbc",
+			"remote": true
+		}
 	]
 	/**
 	 * Smart Placement
