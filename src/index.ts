@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { parseFinanceMessage } from "./modules/parser/parseFinanceMessage";
 
 type Env = {
   DB: D1Database;
@@ -50,10 +51,26 @@ app.post("/telegram/:secret", async (c) => {
     return c.json({ ok: true });
   }
 
-  const message = update.message;
-  const text = message.text.trim();
-  const chatId = message.chat.id;
-  const telegramUser = message.from;
+const message = update.message;
+
+if (!message) {
+  return c.json({ ok: true });
+}
+
+const rawText = message.text;
+const telegramUser = message.from;
+
+if (typeof rawText !== "string" || !telegramUser) {
+  return c.json({ ok: true });
+}
+
+const text = rawText.trim();
+
+if (!text) {
+  return c.json({ ok: true });
+}
+
+const chatId = message.chat.id;
 
   const userId = await ensureUser(c.env.DB, {
     telegramUserId: telegramUser.id,
@@ -88,15 +105,18 @@ app.post("/telegram/:secret", async (c) => {
       c.env.BOT_TOKEN,
       chatId,
       [
-        "Команды:",
-        "/start — начать работу",
-        "/today — расходы за сегодня",
-        "/help — помощь",
-        "",
-        "Чтобы записать расход, напиши:",
-        "еда 25",
-        "такси 15",
-        "кофе 12",
+	      "Команды:",
+	      "/start — начать работу",
+	      "/today — отчёт за сегодня",
+	      "/history — последние операции",
+	      "/delete_last — удалить последнюю операцию",
+	      "/help — помощь",
+	      "",
+	      "Чтобы записать расход или доход, напиши:",
+	      "35 обед",
+	      "25 такси",
+	      "+300 зарплата",
+	      "вчера 50 кофе",
       ].join("\n")
     );
 
@@ -110,45 +130,74 @@ app.post("/telegram/:secret", async (c) => {
     return c.json({ ok: true });
   }
 
-  const parsedExpense = parseExpense(text);
+	if (text === "/history") {
+  const history = await getHistory(c.env.DB, userId);
 
-  if (!parsedExpense) {
-    await sendMessage(
-      c.env.BOT_TOKEN,
-      chatId,
-      [
-        "Я пока не понял сообщение.",
-        "",
-        "Напиши расход в таком формате:",
-        "такси 15",
-        "еда 35",
-        "кофе 12",
-      ].join("\n")
-    );
+  await sendMessage(c.env.BOT_TOKEN, chatId, history);
+  return c.json({ ok: true });
+}
 
-    return c.json({ ok: true });
-  }
+if (text === "/delete_last") {
+  const result = await deleteLastTransaction(c.env.DB, userId);
 
-  const categoryId = await findOrCreateCategory(
-    c.env.DB,
-    userId,
-    parsedExpense.category
-  );
+  await sendMessage(c.env.BOT_TOKEN, chatId, result);
+  return c.json({ ok: true });
+}
 
-  await addExpense(c.env.DB, {
-    userId,
-    categoryId,
-    amount: parsedExpense.amount,
-    note: parsedExpense.category,
-  });
 
+const parsed = parseFinanceMessage(text, {
+  currency: "TJS",
+});
+
+if (!parsed.ok) {
   await sendMessage(
     c.env.BOT_TOKEN,
     chatId,
-    `Записал расход: ${parsedExpense.category} — ${parsedExpense.amount} TJS`
+    [
+      parsed.message,
+      "",
+      "Попробуй так:",
+      "35 обед",
+      "25 такси",
+      "+300 зарплата",
+      "вчера 50 кофе",
+    ].join("\n")
   );
 
   return c.json({ ok: true });
+}
+
+const categoryId = await findOrCreateCategory(
+  c.env.DB,
+  userId,
+  parsed.categoryCode
+);
+
+await addTransaction(c.env.DB, {
+  userId,
+  categoryId,
+  type: parsed.type,
+  amount: parsed.amount,
+  note: parsed.note,
+  transactionDate: parsed.transactionDate,
+});
+
+const operationLabel = parsed.type === "income" ? "Доход" : "Расход";
+const savedLabel = parsed.type === "income" ? "Доход сохранён" : "Расход сохранён";
+
+await sendMessage(
+  c.env.BOT_TOKEN,
+  chatId,
+  [
+    `✅ ${savedLabel}`,
+    "",
+    `${parsed.amount} ${parsed.currency} · ${operationLabel} · ${parsed.note}`,
+    `Категория: ${parsed.categoryCode}`,
+    `Дата: ${parsed.transactionDate}`,
+  ].join("\n")
+);
+
+return c.json({ ok: true });
 });
 
 async function ensureUser(
@@ -255,17 +304,17 @@ async function findOrCreateCategory(
   return Number(result.meta.last_row_id);
 }
 
-async function addExpense(
+async function addTransaction(
   db: D1Database,
   input: {
     userId: number;
     categoryId: number;
+    type: "expense" | "income";
     amount: number;
     note: string;
+    transactionDate: string;
   }
 ): Promise<void> {
-  const today = new Date().toISOString().slice(0, 10);
-
   await db
     .prepare(
       `
@@ -277,15 +326,16 @@ async function addExpense(
         note,
         transaction_date
       )
-      VALUES (?, ?, 'expense', ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?)
       `
     )
     .bind(
       input.userId,
       input.categoryId,
+      input.type,
       input.amount,
       input.note,
-      today
+      input.transactionDate
     )
     .run();
 }
@@ -294,49 +344,75 @@ async function getTodayReport(
   db: D1Database,
   userId: number
 ): Promise<string> {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Dushanbe",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 
   const result = await db
     .prepare(
       `
       SELECT
         t.amount,
+        t.type,
         c.name AS category_name
       FROM transactions t
       LEFT JOIN categories c ON c.id = t.category_id
       WHERE t.user_id = ?
-        AND t.transaction_date = ?
-        AND t.type = 'expense'
+  			AND t.transaction_date = ?
+  			AND t.deleted_at IS NULL
       ORDER BY t.id ASC
       `
     )
     .bind(userId, today)
     .all<{
       amount: number;
+      type: "expense" | "income";
       category_name: string | null;
     }>();
 
   const rows = result.results ?? [];
 
   if (rows.length === 0) {
-    return "Сегодня расходов пока нет.";
+    return [
+      "Сегодня операций пока нет.",
+      "",
+      "Запиши первую:",
+      "35 обед",
+      "+300 зарплата",
+    ].join("\n");
   }
 
-  const total = rows.reduce((sum, row) => sum + Number(row.amount), 0);
+  const incomeTotal = rows
+    .filter((row) => row.type === "income")
+    .reduce((sum, row) => sum + Number(row.amount), 0);
+
+  const expenseTotal = rows
+    .filter((row) => row.type === "expense")
+    .reduce((sum, row) => sum + Number(row.amount), 0);
+
+  const balance = incomeTotal - expenseTotal;
 
   const lines = rows.map((row, index) => {
     const category = row.category_name ?? "без категории";
-    return `${index + 1}. ${category} — ${row.amount} TJS`;
+    const sign = row.type === "income" ? "+" : "-";
+
+    return `${index + 1}. ${sign}${row.amount} TJS · ${category}`;
   });
 
   return [
-    "Расходы за сегодня:",
+    `📊 Сегодня · ${today}`,
     "",
     ...lines,
     "",
-    `Итого: ${total} TJS`,
+    `Доходы: ${incomeTotal} TJS`,
+    `Расходы: ${expenseTotal} TJS`,
+    `Остаток: ${balance} TJS`,
   ].join("\n");
 }
+
 
 function parseExpense(
   text: string
@@ -377,6 +453,140 @@ async function sendMessage(
       text,
     }),
   });
+}
+
+async function getHistory(
+  db: D1Database,
+  userId: number
+): Promise<string> {
+  const result = await db
+    .prepare(
+      `
+      SELECT
+        t.id,
+        t.amount,
+        t.type,
+        t.note,
+        t.transaction_date,
+        t.created_at,
+        c.name AS category_name
+      FROM transactions t
+      LEFT JOIN categories c ON c.id = t.category_id
+      WHERE t.user_id = ?
+        AND t.deleted_at IS NULL
+      ORDER BY t.created_at DESC, t.id DESC
+      LIMIT 10
+      `
+    )
+    .bind(userId)
+    .all<{
+      id: number;
+      amount: number;
+      type: "expense" | "income";
+      note: string | null;
+      transaction_date: string;
+      created_at: string;
+      category_name: string | null;
+    }>();
+
+  const rows = result.results ?? [];
+
+  if (rows.length === 0) {
+    return [
+      "История пока пустая.",
+      "",
+      "Запиши первую операцию:",
+      "35 обед",
+      "+300 зарплата",
+    ].join("\n");
+  }
+
+  const lines = rows.map((row, index) => {
+    const sign = row.type === "income" ? "+" : "-";
+    const category = row.category_name ?? "без категории";
+    const note = row.note ? ` · ${row.note}` : "";
+
+    return `${index + 1}. ${sign}${row.amount} TJS · ${category}${note} · ${row.transaction_date}`;
+  });
+
+  return [
+    "🧾 Последние операции:",
+    "",
+    ...lines,
+    "",
+    "Чтобы удалить последнюю запись:",
+    "/delete_last",
+  ].join("\n");
+}
+
+async function deleteLastTransaction(
+  db: D1Database,
+  userId: number
+): Promise<string> {
+  const lastTransaction = await db
+    .prepare(
+      `
+      SELECT
+        t.id,
+        t.amount,
+        t.type,
+        t.note,
+        t.transaction_date,
+        c.name AS category_name
+      FROM transactions t
+      LEFT JOIN categories c ON c.id = t.category_id
+      WHERE t.user_id = ?
+        AND t.deleted_at IS NULL
+      ORDER BY t.created_at DESC, t.id DESC
+      LIMIT 1
+      `
+    )
+    .bind(userId)
+    .first<{
+      id: number;
+      amount: number;
+      type: "expense" | "income";
+      note: string | null;
+      transaction_date: string;
+      category_name: string | null;
+    }>();
+
+  if (!lastTransaction) {
+    return [
+      "Нет активных операций для удаления.",
+      "",
+      "Можешь записать новую:",
+      "35 обед",
+    ].join("\n");
+  }
+
+  const deletedAt = new Date().toISOString();
+
+  await db
+    .prepare(
+      `
+      UPDATE transactions
+      SET deleted_at = ?
+      WHERE id = ?
+        AND user_id = ?
+        AND deleted_at IS NULL
+      `
+    )
+    .bind(deletedAt, lastTransaction.id, userId)
+    .run();
+
+  const sign = lastTransaction.type === "income" ? "+" : "-";
+  const category = lastTransaction.category_name ?? "без категории";
+  const note = lastTransaction.note ? ` · ${lastTransaction.note}` : "";
+
+  return [
+    "🗑 Последняя операция удалена.",
+    "",
+    `${sign}${lastTransaction.amount} TJS · ${category}${note}`,
+    `Дата операции: ${lastTransaction.transaction_date}`,
+    "",
+    "Она больше не будет учитываться в отчётах.",
+  ].join("\n");
 }
 
 export default app;
