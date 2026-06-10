@@ -7,22 +7,39 @@ type Env = {
   WEBHOOK_SECRET: string;
 };
 
-type TelegramUpdate = {
-  update_id: number;
+type TelegramUser = {
+  id: number;
+  is_bot: boolean;
+  first_name?: string;
+  username?: string;
+};
+
+type TelegramChat = {
+  id: number;
+  type: string;
+};
+
+type TelegramMessage = {
+  message_id: number;
+  text?: string;
+  chat: TelegramChat;
+  from?: TelegramUser;
+};
+
+type TelegramCallbackQuery = {
+  id: string;
+  from: TelegramUser;
+  data?: string;
   message?: {
     message_id: number;
-    text?: string;
-    chat: {
-      id: number;
-      type: string;
-    };
-    from?: {
-      id: number;
-      is_bot: boolean;
-      first_name?: string;
-      username?: string;
-    };
+    chat: TelegramChat;
   };
+};
+
+type TelegramUpdate = {
+  update_id: number;
+  message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -46,6 +63,11 @@ app.post("/telegram/:secret", async (c) => {
   }
 
   const update = await c.req.json<TelegramUpdate>();
+
+	if (update.callback_query) {
+  	await handleCallbackQuery(c.env.DB, c.env.BOT_TOKEN, update.callback_query);
+  	return c.json({ ok: true });
+	}
 
   if (!update.message || !update.message.text || !update.message.from) {
     return c.json({ ok: true });
@@ -78,6 +100,8 @@ const chatId = message.chat.id;
     firstName: telegramUser.first_name ?? null,
     username: telegramUser.username ?? null,
   });
+
+
 
   if (text === "/start") {
     await sendMessage(
@@ -138,9 +162,15 @@ const chatId = message.chat.id;
 }
 
 if (text === "/delete_last") {
-  const result = await deleteLastTransaction(c.env.DB, userId);
+  const confirmation = await buildDeleteLastConfirmation(c.env.DB, userId);
 
-  await sendMessage(c.env.BOT_TOKEN, chatId, result);
+  await sendMessage(
+    c.env.BOT_TOKEN,
+    chatId,
+    confirmation.text,
+    confirmation.replyMarkup
+  );
+
   return c.json({ ok: true });
 }
 
@@ -441,7 +471,8 @@ function parseExpense(
 async function sendMessage(
   botToken: string,
   chatId: number,
-  text: string
+  text: string,
+  replyMarkup?: unknown
 ): Promise<void> {
   await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
     method: "POST",
@@ -450,6 +481,24 @@ async function sendMessage(
     },
     body: JSON.stringify({
       chat_id: chatId,
+      text,
+      reply_markup: replyMarkup,
+    }),
+  });
+}
+
+async function answerCallbackQuery(
+  botToken: string,
+  callbackQueryId: string,
+  text: string
+): Promise<void> {
+  await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
       text,
     }),
   });
@@ -587,6 +636,224 @@ async function deleteLastTransaction(
     "",
     "Она больше не будет учитываться в отчётах.",
   ].join("\n");
+}
+
+
+async function buildDeleteLastConfirmation(
+  db: D1Database,
+  userId: number
+): Promise<{
+  text: string;
+  replyMarkup?: unknown;
+}> {
+  const lastTransaction = await db
+    .prepare(
+      `
+      SELECT
+        t.id,
+        t.amount,
+        t.type,
+        t.note,
+        t.transaction_date,
+        c.name AS category_name
+      FROM transactions t
+      LEFT JOIN categories c ON c.id = t.category_id
+      WHERE t.user_id = ?
+        AND t.deleted_at IS NULL
+      ORDER BY t.created_at DESC, t.id DESC
+      LIMIT 1
+      `
+    )
+    .bind(userId)
+    .first<{
+      id: number;
+      amount: number;
+      type: "expense" | "income";
+      note: string | null;
+      transaction_date: string;
+      category_name: string | null;
+    }>();
+
+  if (!lastTransaction) {
+    return {
+      text: [
+        "Нет активных операций для удаления.",
+        "",
+        "Можешь записать новую:",
+        "35 обед",
+      ].join("\n"),
+    };
+  }
+
+  const sign = lastTransaction.type === "income" ? "+" : "-";
+  const category = lastTransaction.category_name ?? "без категории";
+  const note = lastTransaction.note ? ` · ${lastTransaction.note}` : "";
+
+  return {
+    text: [
+      "Удалить последнюю операцию?",
+      "",
+      `${sign}${lastTransaction.amount} TJS · ${category}${note}`,
+      `Дата операции: ${lastTransaction.transaction_date}`,
+    ].join("\n"),
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          {
+            text: "Да, удалить",
+            callback_data: `delete_last:confirm:${lastTransaction.id}`,
+          },
+          {
+            text: "Отмена",
+            callback_data: `delete_last:cancel:${lastTransaction.id}`,
+          },
+        ],
+      ],
+    },
+  };
+}
+
+async function handleCallbackQuery(
+  db: D1Database,
+  botToken: string,
+  callbackQuery: TelegramCallbackQuery
+): Promise<void> {
+  const data = callbackQuery.data;
+
+  if (!data) {
+    await answerCallbackQuery(botToken, callbackQuery.id, "Нет действия.");
+    return;
+  }
+
+  const chatId = callbackQuery.message?.chat.id ?? callbackQuery.from.id;
+
+  if (data.startsWith("delete_last:cancel:")) {
+    await answerCallbackQuery(botToken, callbackQuery.id, "Отменено.");
+
+    await sendMessage(
+      botToken,
+      chatId,
+      "Удаление отменено. Операция осталась в истории."
+    );
+
+    return;
+  }
+
+  if (data.startsWith("delete_last:confirm:")) {
+    const transactionIdText = data.replace("delete_last:confirm:", "");
+    const transactionId = Number(transactionIdText);
+
+    if (!Number.isInteger(transactionId) || transactionId <= 0) {
+      await answerCallbackQuery(botToken, callbackQuery.id, "Некорректная операция.");
+      return;
+    }
+
+    const user = await db
+      .prepare(
+        `
+        SELECT id
+        FROM users
+        WHERE telegram_user_id = ?
+        LIMIT 1
+        `
+      )
+      .bind(callbackQuery.from.id)
+      .first<{ id: number }>();
+
+    if (!user) {
+      await answerCallbackQuery(botToken, callbackQuery.id, "Пользователь не найден.");
+      return;
+    }
+
+    const result = await deleteTransactionById(db, {
+      userId: user.id,
+      transactionId,
+    });
+
+    await answerCallbackQuery(botToken, callbackQuery.id, result.shortText);
+    await sendMessage(botToken, chatId, result.fullText);
+
+    return;
+  }
+
+  await answerCallbackQuery(botToken, callbackQuery.id, "Неизвестное действие.");
+}
+
+async function deleteTransactionById(
+  db: D1Database,
+  input: {
+    userId: number;
+    transactionId: number;
+  }
+): Promise<{
+  shortText: string;
+  fullText: string;
+}> {
+  const transaction = await db
+    .prepare(
+      `
+      SELECT
+        t.id,
+        t.amount,
+        t.type,
+        t.note,
+        t.transaction_date,
+        c.name AS category_name
+      FROM transactions t
+      LEFT JOIN categories c ON c.id = t.category_id
+      WHERE t.id = ?
+        AND t.user_id = ?
+        AND t.deleted_at IS NULL
+      LIMIT 1
+      `
+    )
+    .bind(input.transactionId, input.userId)
+    .first<{
+      id: number;
+      amount: number;
+      type: "expense" | "income";
+      note: string | null;
+      transaction_date: string;
+      category_name: string | null;
+    }>();
+
+  if (!transaction) {
+    return {
+      shortText: "Операция уже недоступна.",
+      fullText: "Эта операция уже удалена или не найдена.",
+    };
+  }
+
+  const deletedAt = new Date().toISOString();
+
+  await db
+    .prepare(
+      `
+      UPDATE transactions
+      SET deleted_at = ?
+      WHERE id = ?
+        AND user_id = ?
+        AND deleted_at IS NULL
+      `
+    )
+    .bind(deletedAt, input.transactionId, input.userId)
+    .run();
+
+  const sign = transaction.type === "income" ? "+" : "-";
+  const category = transaction.category_name ?? "без категории";
+  const note = transaction.note ? ` · ${transaction.note}` : "";
+
+  return {
+    shortText: "Удалено.",
+    fullText: [
+      "🗑 Операция удалена.",
+      "",
+      `${sign}${transaction.amount} TJS · ${category}${note}`,
+      `Дата операции: ${transaction.transaction_date}`,
+      "",
+      "Она больше не будет учитываться в отчётах.",
+    ].join("\n"),
+  };
 }
 
 export default app;
